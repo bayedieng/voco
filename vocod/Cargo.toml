@@ -1,0 +1,7 @@
+[package]
+name = "vocod"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+voco-lib.workspace = true
