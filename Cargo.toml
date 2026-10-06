@@ -1,10 +1,8 @@
-[workspace]
-members = ["voco-lib", "vocod", "xtask"]
-default-members = ["voco-lib", "vocod"]
-resolver = "3"
-
-[workspace.package]
+[package]
+name = "vocod"
+version = "0.1.0"
 edition = "2024"
 
-[workspace.dependencies]
-voco-lib = { path = "voco-lib" }
+[dependencies]
+enigo = { version = "0.6.1", features = ["wayland"] }
+ort = "2.0.0-rc.13"

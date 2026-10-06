@@ -1,1 +1,5 @@
 /target/
+*.onnx
+*.txt
+*.wav
+xtask/target/
