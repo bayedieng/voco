@@ -6,3 +6,8 @@ edition = "2024"
 [dependencies]
 enigo = { version = "0.6.1", features = ["wayland"] }
 ort = "2.0.0-rc.13"
+
+[build-dependencies]
+bzip2 = "0.6.1"
+reqwest = { version = "0.13.5", features = ["blocking"] }
+tar = "0.4.46"
