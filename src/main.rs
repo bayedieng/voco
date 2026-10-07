@@ -6,6 +6,7 @@ mod model;
 mod output;
 mod preprocessing;
 mod utterance;
+mod vad;
 
 use std::{error::Error, path::Path, time::Instant};
 
@@ -22,6 +23,7 @@ fn main() -> Result<()> {
     } else if args.mic {
         dictation::run(
             args.model_dir(),
+            &args.vad_model,
             args.device.as_deref(),
             args.endpoint_config(),
             args.print_only,

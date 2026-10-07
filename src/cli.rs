@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Parser};
 
-use crate::{model::DEFAULT_MODEL_DIR, utterance::EndpointConfig};
+use crate::{model::DEFAULT_MODEL_DIR, utterance::EndpointConfig, vad::DEFAULT_VAD_PATH};
 
 #[derive(Parser)]
 #[command(version, about = "Parakeet WAV transcription and microphone dictation")]
@@ -36,16 +36,20 @@ pub struct Args {
     #[arg(long, requires = "mic", conflicts_with_all = ["wav", "list_devices"])]
     pub print_only: bool,
 
-    /// RMS activity threshold on normalized audio; raise it for noisy rooms
-    #[arg(long, default_value_t = 0.01)]
+    /// Silero VAD ONNX model (512-sample 16kHz streaming interface)
+    #[arg(long, default_value = DEFAULT_VAD_PATH)]
+    pub vad_model: PathBuf,
+
+    /// Speech probability required to start an utterance (0..1); raise to reject more noise
+    #[arg(long = "vad-threshold", alias = "threshold", default_value_t = 0.5)]
     pub threshold: f32,
 
-    /// End an utterance after this much quiet audio
+    /// End an utterance after this much VAD-classified non-speech
     #[arg(long, default_value_t = 600)]
     pub silence_ms: u64,
 
-    /// Reject bursts shorter than this much above-threshold audio
-    #[arg(long, default_value_t = 200)]
+    /// Reject bursts shorter than this much VAD-confirmed speech
+    #[arg(long, default_value_t = 96)]
     pub min_speech_ms: u64,
 
     /// Split long utterances to bound inference latency and memory
@@ -84,5 +88,9 @@ mod tests {
         assert_eq!(args.model_dir(), Path::new("models"));
         let args = Args::try_parse_from(["vocod", "--mic", "--print-only"]).unwrap();
         assert!(args.mic && args.print_only);
+        assert_eq!(
+            args.endpoint_config().min_speech_ms,
+            EndpointConfig::default().min_speech_ms
+        );
     }
 }

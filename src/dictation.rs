@@ -21,10 +21,12 @@ use crate::{
     output::DictationOutput,
     preprocessing::Preprocessor,
     utterance::{EndpointConfig, Segmenter},
+    vad::{SileroVad, SpeechDetector},
 };
 
 pub fn run(
     model_dir: &Path,
+    vad_path: &Path,
     device: Option<&str>,
     config: EndpointConfig,
     print_only: bool,
@@ -33,6 +35,7 @@ pub fn run(
     let mut model = Parakeet::load(model_dir)?;
     let mut preprocessor = Preprocessor::new();
     let mut output = DictationOutput::new(print_only)?;
+    let segmenter = Segmenter::new(config, SileroVad::load(vad_path)?)?;
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
     ctrlc::set_handler(move || {
@@ -47,7 +50,15 @@ pub fn run(
     let worker = thread::Builder::new()
         .name("audio-endpointing".into())
         .spawn(move || {
-            capture_worker(samples, rate, dropped, failed, worker_stop, config, sender)
+            capture_worker(
+                samples,
+                rate,
+                dropped,
+                failed,
+                worker_stop,
+                segmenter,
+                sender,
+            )
         })?;
     eprintln!(
         "Listening. {} Ctrl+C stops capture and finishes pending utterances.",
@@ -81,17 +92,16 @@ pub fn run(
     worker_result
 }
 
-fn capture_worker(
+fn capture_worker<D: SpeechDetector>(
     mut samples: Consumer<f32>,
     rate: usize,
     dropped: Arc<AtomicUsize>,
     failed: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    config: EndpointConfig,
+    mut segmenter: Segmenter<D>,
     sender: SyncSender<Vec<f32>>,
 ) -> Result<()> {
     let mut resampler = StreamingResampler::new(rate)?;
-    let mut segmenter = Segmenter::new(config)?;
     let mut native = Vec::with_capacity(4096);
     let mut converted = Vec::with_capacity(8192);
     loop {
@@ -119,7 +129,7 @@ fn capture_worker(
         if !native.is_empty() {
             converted.clear();
             resampler.push(&native, &mut converted)?;
-            segmenter.push(&converted, |audio| enqueue(&sender, audio));
+            segmenter.push(&converted, |audio| enqueue(&sender, audio))?;
         } else if stop.load(Ordering::Relaxed) {
             break;
         } else {
@@ -128,8 +138,8 @@ fn capture_worker(
     }
     converted.clear();
     resampler.finish(&mut converted)?;
-    segmenter.push(&converted, |audio| enqueue(&sender, audio));
-    if let Some(audio) = segmenter.finish() {
+    segmenter.push(&converted, |audio| enqueue(&sender, audio))?;
+    if let Some(audio) = segmenter.finish()? {
         enqueue(&sender, audio);
     }
     Ok(())
@@ -147,7 +157,19 @@ fn enqueue(sender: &SyncSender<Vec<f32>>, audio: Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vad::FRAME_SAMPLES;
     use rtrb::RingBuffer;
+
+    struct FixedDetector;
+    impl SpeechDetector for FixedDetector {
+        fn probability(&mut self, _: &[f32; FRAME_SAMPLES]) -> Result<f32> {
+            Ok(0.9)
+        }
+        fn reset(&mut self) {}
+    }
+    fn test_segmenter() -> Segmenter<FixedDetector> {
+        Segmenter::new(EndpointConfig::default(), FixedDetector).unwrap()
+    }
 
     #[test]
     fn worker_drains_resamples_and_flushes_on_shutdown() -> Result<()> {
@@ -163,7 +185,7 @@ mod tests {
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(true)),
-                EndpointConfig::default(),
+                test_segmenter(),
                 sender,
             )?;
             let utterances: Vec<_> = receiver.into_iter().collect();
@@ -171,6 +193,63 @@ mod tests {
             assert!(utterances[0].len() >= 7000);
             assert!(utterances[0].iter().all(|x| x.is_finite()));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn neural_vad_gates_silence_and_tones_before_inference() -> Result<()> {
+        let vad = SileroVad::load(Path::new(crate::vad::DEFAULT_VAD_PATH))?;
+        let mut segmenter = Segmenter::new(EndpointConfig::default(), vad)?;
+        let audio: Vec<_> = (0..32000)
+            .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 16000.0).sin() * 0.2)
+            .collect();
+        for chunk in audio.chunks(137) {
+            segmenter.push(chunk, |_| panic!("non-speech reached inference queue"))?;
+        }
+        segmenter.push(&vec![0.0; 32000], |_| {
+            panic!("silence reached inference queue")
+        })?;
+        assert!(segmenter.finish()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "VAD -> Parakeet speech integration: cargo test --release -- --ignored"]
+    fn neural_vad_utterances_transcribe_bundled_speech() -> Result<()> {
+        let audio = crate::audio::read_wav(
+            &Path::new(crate::model::DEFAULT_MODEL_DIR).join("test_wavs/0.wav"),
+        )?;
+        let vad = SileroVad::load(Path::new(crate::vad::DEFAULT_VAD_PATH))?;
+        let mut segmenter = Segmenter::new(EndpointConfig::default(), vad)?;
+        let mut utterances = Vec::new();
+        for chunk in audio.chunks(137) {
+            segmenter.push(chunk, |audio| utterances.push(audio))?;
+        }
+        segmenter.push(&vec![0.0; 16000], |audio| utterances.push(audio))?;
+        if let Some(audio) = segmenter.finish()? {
+            utterances.push(audio);
+        }
+        assert!(!utterances.is_empty(), "speech was not detected");
+        let mut model = Parakeet::load(Path::new(crate::model::DEFAULT_MODEL_DIR))?;
+        let mut preprocessor = Preprocessor::new();
+        let mut text = String::new();
+        for audio in utterances {
+            let start = Instant::now();
+            let features = preprocessor.compute(&audio)?;
+            let preprocessing = start.elapsed();
+            let start = Instant::now();
+            text.push_str(&model.transcribe(features)?);
+            text.push(' ');
+            eprintln!(
+                "Speech context: {:.2}s | preprocessing: {:.1}ms | inference: {:.1}ms",
+                audio.len() as f64 / crate::audio::SAMPLE_RATE as f64,
+                preprocessing.as_secs_f64() * 1000.0,
+                start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        eprintln!("VAD-gated transcript: {text}");
+        assert!(text.contains("I don't wish to see it any more"), "{text}");
+        assert!(text.contains("the old portrait"), "{text}");
         Ok(())
     }
 
@@ -185,7 +264,7 @@ mod tests {
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(false)),
-                EndpointConfig::default(),
+                test_segmenter(),
                 sender
             )
             .is_err()
@@ -214,7 +293,7 @@ mod tests {
             Arc::new(AtomicUsize::new(100)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(true)),
-            EndpointConfig::default(),
+            test_segmenter(),
             sender,
         )?;
         assert!(receiver.into_iter().next().is_none());
