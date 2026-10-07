@@ -1,12 +1,18 @@
 mod audio;
 mod cli;
-mod dictation;
+#[cfg(unix)]
+mod control;
+#[cfg(unix)]
+mod hotkey;
+#[cfg(unix)]
+mod manual;
 mod microphone;
 mod model;
+mod model_cache;
 mod output;
 mod preprocessing;
-mod utterance;
-mod vad;
+mod sound;
+mod wake;
 
 use std::{error::Error, path::Path, time::Instant};
 
@@ -18,21 +24,58 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.preview_cues {
+        return sound::preview();
+    }
+    if args.daemon || args.toggle || args.daemon_status || args.quit {
+        return daemon_command(&args);
+    }
     if args.list_devices {
         microphone::list_devices()
-    } else if args.mic {
-        dictation::run(
-            args.model_dir(),
-            &args.vad_model,
-            args.device.as_deref(),
-            args.endpoint_config(),
-            args.print_only,
-        )
     } else {
         transcribe_wav(
             args.wav.as_deref().expect("CLI requires a mode"),
             args.model_dir(),
         )
+    }
+}
+
+fn daemon_command(args: &Args) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let socket = args
+            .control_socket
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(control::default_socket)?;
+        if !args.daemon {
+            let action = if args.toggle {
+                "toggle"
+            } else if args.quit {
+                "quit"
+            } else {
+                "status"
+            };
+            print!("{}", control::request(&socket, action)?);
+            return Ok(());
+        }
+        manual::run(manual::Options {
+            model_dir: args.model_dir().to_owned(),
+            device: args.device.clone(),
+            socket,
+            shortcut: args.hotkey.clone(),
+            external_hotkey: args.external_hotkey,
+            no_cues: args.no_cues,
+            print_only: args.print_only,
+            idle_timeout: std::time::Duration::from_secs(args.model_idle_secs),
+            keep_loaded: args.keep_model_loaded,
+            max_recording: std::time::Duration::from_secs(args.max_recording_secs),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err("daemon control currently supports Linux and macOS".into())
     }
 }
 

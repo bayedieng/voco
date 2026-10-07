@@ -10,10 +10,6 @@ const MODEL_WEIGHTS_PATH: &str = concat!(
     "/models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
 );
 
-const VAD_URL: &str = "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.3/src/silero_vad/data/silero_vad.onnx";
-const VAD_NAME: &str = "silero-vad-v6.2.3.onnx";
-const VAD_SHA256: &str = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3";
-
 fn main() -> Result<(), Box<dyn Error>> {
     if !Path::new(MODEL_WEIGHTS_PATH).exists() {
         println!("Downloading weights...");
@@ -27,40 +23,46 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         tar.unpack(MODELS_DIR)?;
     }
-    ensure_vad()?;
+    ensure_cues()?;
     Ok(())
 }
 
-/// Pinned, checksum-verified weights; never publish a partial download as the model.
-fn ensure_vad() -> Result<(), Box<dyn Error>> {
-    let path = Path::new(MODELS_DIR).join(VAD_NAME);
-    let bytes = if path.exists() {
-        std::fs::read(&path)?
-    } else {
-        println!("cargo:warning=Downloading Silero VAD v6.2.3 (2.3 MB)");
-        reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(120))
-            .build()?
-            .get(VAD_URL)
-            .send()?
-            .error_for_status()?
-            .bytes()?
-            .to_vec()
-    };
-    let hash = format!("{:x}", Sha256::digest(&bytes));
-    if hash != VAD_SHA256 {
-        return Err(format!(
-            "Silero VAD checksum mismatch at {}; remove the file and rebuild",
-            path.display()
-        )
-        .into());
-    }
-    if !path.exists() {
-        std::fs::create_dir_all(MODELS_DIR)?;
-        let temporary = path.with_extension("onnx.part");
-        std::fs::write(&temporary, &bytes)?;
-        std::fs::rename(temporary, path)?;
+fn ensure_cues() -> Result<(), Box<dyn Error>> {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
+    for (source, target, expected) in [
+        (
+            "click4",
+            "cue-start.wav",
+            "0d80e2c82426316b140b0686e10f83924ef794e9a9dfe13aaaa794b18200b048",
+        ),
+        (
+            "click3",
+            "cue-done.wav",
+            "8d0676a5bcbfedad3e65b7b73e93a044216d7f192c99a3a05caf21e2aa4a8dda",
+        ),
+    ] {
+        let path = out.join(target);
+        let bytes = if path.exists() {
+            std::fs::read(&path)?
+        } else {
+            let url = format!(
+                "https://raw.githubusercontent.com/Calinou/kenney-ui-audio/8c3d81b9159d058c444f89d12d518276b0b09345/addons/kenney_ui_audio/{source}.wav"
+            );
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()?
+                .get(url)
+                .send()?
+                .error_for_status()?
+                .bytes()?
+                .to_vec()
+        };
+        if format!("{:x}", Sha256::digest(&bytes)) != expected {
+            return Err("cue audio checksum mismatch".into());
+        }
+        if !path.exists() {
+            std::fs::write(path, bytes)?;
+        }
     }
     Ok(())
 }

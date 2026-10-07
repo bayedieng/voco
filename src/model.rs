@@ -44,6 +44,9 @@ impl Parakeet {
                 .map_err(ort::Error::<()>::from)?
                 .with_inter_threads(1)
                 .map_err(ort::Error::<()>::from)?
+                // Keep fast intra-run parallelism, but park ORT workers between requests.
+                .with_config_entry("session.force_spinning_stop", "1")
+                .map_err(ort::Error::<()>::from)?
                 .commit_from_file(dir.join(name))?)
         };
         let mut tokens = vec![String::new(); VOCAB_SIZE];
@@ -181,6 +184,65 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("the old portrait."), "{text}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "loads large models and measures idle resources; use --release --nocapture"]
+    fn resources_cold_warm_and_evicted() -> Result<()> {
+        use crate::model_cache::ModelCache;
+        use std::time::{Duration, Instant};
+        fn rss() -> Result<String> {
+            Ok(std::fs::read_to_string("/proc/self/status")?
+                .lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .unwrap()
+                .to_owned())
+        }
+        fn ticks() -> Result<u64> {
+            let stat = std::fs::read_to_string("/proc/self/stat")?;
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect();
+            Ok(fields[11].parse::<u64>()? + fields[12].parse::<u64>()?)
+        }
+        let dir = Path::new(DEFAULT_MODEL_DIR);
+        let audio = read_wav(&dir.join("test_wavs/0.wav"))?;
+        let mut frontend = Preprocessor::new();
+        let mut cache = ModelCache::new(Some(Duration::from_secs(1)));
+        eprintln!("before load: {}", rss()?);
+        let start = Instant::now();
+        cache.get_or_load(|| Parakeet::load(dir))?;
+        eprintln!(
+            "cold model load: {:.3}s; {}",
+            start.elapsed().as_secs_f64(),
+            rss()?
+        );
+        for run in 1..=2 {
+            let features = frontend.compute(&audio)?;
+            let start = Instant::now();
+            let text = cache
+                .get_or_load(|| Parakeet::load(dir))?
+                .transcribe(features)?;
+            assert!(
+                text.starts_with("Well, I don't wish to see it any more"),
+                "{text}"
+            );
+            eprintln!(
+                "warm inference {run}: {:.3}s; {}",
+                start.elapsed().as_secs_f64(),
+                rss()?
+            );
+        }
+        let before = ticks()?;
+        std::thread::sleep(Duration::from_secs(2));
+        eprintln!("loaded-model idle CPU ticks over 2s: {}", ticks()? - before);
+        assert!(cache.expire(Instant::now() + Duration::from_secs(2), false));
+        eprintln!("after eviction: {}", rss()?);
         Ok(())
     }
 }

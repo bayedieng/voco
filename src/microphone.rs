@@ -10,7 +10,15 @@ use cpal::{
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::Result;
+use crate::{Result, wake::Wake};
+
+#[derive(Clone)]
+struct CallbackControl {
+    stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
+    wake: Arc<Wake>,
+}
 
 pub struct Capture {
     stream: cpal::Stream,
@@ -36,7 +44,12 @@ pub fn list_devices() -> Result<()> {
 }
 
 impl Capture {
-    pub fn open(name: Option<&str>, stop: Arc<AtomicBool>) -> Result<Self> {
+    pub fn open_quiet(
+        name: Option<&str>,
+        stop: Arc<AtomicBool>,
+        wake: Arc<Wake>,
+        quiet: bool,
+    ) -> Result<Self> {
         let host = cpal::default_host();
         let device = if let Some(name) = name {
             host.input_devices()?
@@ -46,7 +59,25 @@ impl Capture {
             host.default_input_device()
                 .ok_or("no default microphone available")?
         };
-        let supported = device.default_input_config()?;
+        // Avoid our resampler when the host can directly supply mono 16kHz.
+        let supported = device
+            .supported_input_configs()
+            .ok()
+            .and_then(|mut configs| {
+                configs
+                    .find(|c| {
+                        c.channels() == 1
+                            && c.min_sample_rate().0 <= 16000
+                            && c.max_sample_rate().0 >= 16000
+                            && matches!(
+                                c.sample_format(),
+                                cpal::SampleFormat::F32 | cpal::SampleFormat::I16
+                            )
+                    })
+                    .map(|c| c.with_sample_rate(cpal::SampleRate(16000)))
+            })
+            .map(Ok)
+            .unwrap_or_else(|| device.default_input_config())?;
         let config: cpal::StreamConfig = supported.clone().into();
         let channels = config.channels as usize;
         let sample_rate = config.sample_rate.0 as usize;
@@ -57,17 +88,15 @@ impl Capture {
         let (producer, samples) = RingBuffer::new(sample_rate * 2);
         let dropped = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicBool::new(false));
+        let control = CallbackControl {
+            stop,
+            dropped: Arc::clone(&dropped),
+            failed: Arc::clone(&failed),
+            wake,
+        };
         macro_rules! build {
             ($ty:ty) => {
-                build_stream::<$ty>(
-                    &device,
-                    &config,
-                    channels,
-                    producer,
-                    Arc::clone(&dropped),
-                    Arc::clone(&failed),
-                    stop,
-                )?
+                build_stream::<$ty>(&device, &config, channels, producer, control)?
             };
         }
         let stream = match supported.sample_format() {
@@ -83,10 +112,12 @@ impl Capture {
             cpal::SampleFormat::F64 => build!(f64),
             format => return Err(format!("unsupported microphone sample format: {format}").into()),
         };
-        eprintln!(
-            "Microphone: {} | {sample_rate} Hz, {channels} channel(s)",
-            device.name()?
-        );
+        if !quiet {
+            eprintln!(
+                "Microphone: {} | {sample_rate} Hz, {channels} channel(s)",
+                device.name()?
+            );
+        }
         Ok(Self {
             stream,
             samples,
@@ -126,18 +157,19 @@ fn build_stream<T>(
     config: &cpal::StreamConfig,
     channels: usize,
     mut producer: Producer<f32>,
-    dropped: Arc<AtomicUsize>,
-    failed: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    control: CallbackControl,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
+    let error_control = control.clone();
+    let capacity = config.sample_rate.0 as usize * 2;
+    let notify_at = config.sample_rate.0 as usize * 32 / 1000;
     Ok(device.build_input_stream(
         config,
         move |data: &[T], _| {
-            if stop.load(Ordering::Relaxed) {
+            if control.stop.load(Ordering::Relaxed) {
                 return;
             }
             let mut lost = 0;
@@ -153,11 +185,16 @@ where
                 }
             }
             if lost != 0 {
-                dropped.fetch_add(lost, Ordering::Relaxed);
+                control.dropped.fetch_add(lost, Ordering::Relaxed);
+            }
+            // Batch wakeups at ~32 ms instead of waking for every tiny callback.
+            if lost != 0 || capacity - producer.slots() >= notify_at {
+                control.wake.notify();
             }
         },
         move |_| {
-            failed.store(true, Ordering::Relaxed);
+            error_control.failed.store(true, Ordering::Relaxed);
+            error_control.wake.notify();
         },
         None,
     )?)
