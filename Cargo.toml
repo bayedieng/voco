@@ -1,3 +1,8 @@
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "vocod"
 version = "0.1.0"
@@ -6,8 +11,30 @@ edition = "2024"
 [dependencies]
 enigo = { version = "0.6.1", features = ["wayland"] }
 ort = "2.0.0-rc.13"
+hound = "3.5.1"
+realfft = "3.5.0"
+rubato = "0.16.2"
+cpal = "0.16.0"
+rtrb = "0.3.2"
+ctrlc = { version = "3.4.7", features = ["termination"] }
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0.0"
+global-hotkey = "0.8.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Read the active keymap; input is still emitted exclusively through Enigo.
+x11rb = { version = "0.13", features = ["xkb"] }
+xkeysym = "0.2"
+wayland-client = "0.31"
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+futures-util = "0.3"
+
+[profile.release]
+strip = "debuginfo"
 
 [build-dependencies]
+sha2 = "0.10.9"
 bzip2 = "0.6.1"
 reqwest = { version = "0.13.5", features = ["blocking"] }
 tar = "0.4.46"
